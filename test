@@ -1,0 +1,101 @@
+estimate.parameters.parallel2 <- function(df, metadata, kmin=3, kmax=25, kstep=1, 
+                                         savmin=1.1, savmax=sqrt(ncol(df)), savstep=0.1,  
+                                         formula, return.all=FALSE, weighted=FALSE, p=NULL, distance="euclidean", cores=NULL) {
+  
+  df <- format.check(df)
+  
+  # throw error if distance not supported
+  d.list <- c("euclidean", "maximum", "manhattan", "canberra", "binary", "minkowski")
+  if (!is.element(distance, d.list)) {
+    stop('Please provide supported distance metric.')
+  }
+  
+  #weights
+  # throw error if unweighted and given p
+  if (weighted==FALSE &&
+      !is.null(p)){
+    stop('If providing weights, please set "weighted=TRUE"')
+  }
+  
+  if (weighted==FALSE){
+    p <- rep(1, ncol(df))
+    names(p) <- colnames(df)
+  }
+  
+  if (weighted==TRUE &&
+      is.null(p)){
+    p <- geomeans.c(df)
+  } else {
+    p=p
+  }
+  p <- p[colnames(df)]
+  
+  #shift the reference measure by p
+  df <- shift.reference(df, p)
+  
+  #Build param lists
+  l.k <- seq(from = kmin, to = kmax, by = kstep)
+  nk <- length(l.k)
+  l.sumabsv <- seq(from = savmin, to = savmax, by = savstep)
+  n.sumabsv <- length(l.sumabsv)
+  rtab <- array(numeric(n.sumabsv*nk), dim=c(n.sumabsv, nk))
+  
+  if (return.all==TRUE){
+    cpve.tab <- array(numeric(n.sumabsv*nk), dim=c(n.sumabsv, nk))
+    colnames(cpve.tab)[1:ncol(cpve.tab)] <- paste("K", l.k, sep = "")
+    rownames(cpve.tab)[1:nrow(cpve.tab)] <- paste(l.sumabsv)
+  }
+  
+  if (is.null(cores)){
+    cores <- (parallel::detectCores() -1)
+    cl <- parallel::makeCluster(cores[1])
+    doParallel::registerDoParallel(cl)
+  } else {
+    cl <- parallel::makeCluster(cores)
+    doParallel::registerDoParallel(cl)
+  }
+  message('Building cluster from ', cores, ' threads')
+  
+  #calculate first right singular vectors to save on time
+  out.orth <- PMA::SPC(x = unclass(clr(df)), sumabsv = l.sumabsv[length(l.sumabsv)], K = l.k[length(l.k)], orth = TRUE, trace = FALSE)
+  
+  #parallel loop
+  message('Estimating model fit from sumabsv = ', l.sumabsv[1], ' to ', l.sumabsv[length(l.sumabsv)], ' and K = ', l.k[1], ' to ', l.k[length(l.k)])
+  
+  tryCatch({
+    rtab <- foreach(b=l.k, .combine = 'cbind') %:%
+      foreach(a=l.sumabsv, .combine = 'c', .export = c('penalized.ilr', 'penalized.ilr.vinit', 'format.check', 'clr', 'ilr', 'geomeans.r', 'geomeans.c', 'balance.basis', 'single.balance.basis'), .packages = c("PMA", "vegan")) %dopar% {
+        #perform penalized decomposition
+        penalized.ilr.tab <- penalized.ilr.vinit(df = df, sumabsv=a, K=b, return.all = TRUE, p = p, vinit = out.orth$v.init)
+        penalized.dist <- stats::dist(penalized.ilr.tab$df.transformed, method=distance)
+        
+        # Calculate r2 value from vegan::adonis
+        formchar = as.character(formula)
+        newFormula = as.formula(paste0("penalized.dist ~ ", formchar))  	
+        ps <-vegan::adonis(newFormula, data = unclass(metadata))
+        ps$aov.tab$R2[1]
+      }
+  },
+  error=function(e){cat("Warning :",conditionMessage(e), "\n")})
+  
+  #stop the cluster
+  message('Terminating the cluster')
+  parallel::stopCluster(cl)
+  
+  colnames(rtab)[1:ncol(rtab)] <- paste("K", l.k, sep = "")
+  rownames(rtab)[1:nrow(rtab)] <- paste(l.sumabsv)
+  
+  # Build return list
+  if (return.all==FALSE)return(rtab)
+  if (return.all==TRUE){
+    l.return = list()
+    l.return[['r2.tab']] <- rtab
+    l.return[['k.list']] <- l.k
+    l.return[['sav.list']] <- l.sumabsv
+    l.return[['p']] <- p
+    
+  }
+  
+  return(l.return)
+  
+}
